@@ -470,9 +470,267 @@ async def market_main(callback: CallbackQuery):
     await callback.answer()
 
 # ---------- GAME OF SKATE (упрощённая версия для начала) ----------
+# ========== GAME OF SKATE (ПОЛНОЦЕННАЯ ВЕРСИЯ) ==========
 async def game_menu(message: Message):
-    await message.answer("🎮 Game of Skate в разработке. Скоро появится!")
+    active_games = [(gid, g) for gid, g in games.items() if g["status"] in ["waiting", "active"]]
+    if not active_games:
+        await message.answer("🎮 Нет активных игр. Создать новую?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Создать игру", callback_data="game_create")]
+        ]))
+    else:
+        kb = []
+        for gid, g in active_games:
+            mode = "⚡5m" if g.get("time_limit") == 300 else "🐢2h"
+            status = "⏳ лобби" if g["status"] == "waiting" else "🔥 в процессе"
+            kb.append([InlineKeyboardButton(text=f"Игра #{gid} ({len(g['participants'])} чел) {mode} {status}", callback_data=f"game_view_{gid}")])
+        kb.append([InlineKeyboardButton(text="➕ Создать игру", callback_data="game_create")])
+        await message.answer("Выбери игру:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+async def game_create(callback: CallbackQuery, state: FSMContext):
+    ensure_user(callback.from_user.id)
+    await callback.message.edit_text("Выбери режим игры:", reply_markup=game_mode_keyboard())
+    await state.set_state(GameStates.waiting_game_mode)
+    await callback.answer()
+
+async def game_mode_chosen(callback: CallbackQuery, state: FSMContext):
+    global next_game_id
+    mode = callback.data
+    time_limit = 300 if mode == "game_mode_fast" else 7200
+    mode_name = "Быстрая (5 мин)" if mode == "game_mode_fast" else "Долгая (2 часа)"
+    gid = next_game_id
+    games[gid] = {
+        "creator_id": callback.from_user.id,
+        "status": "waiting",
+        "participants": [callback.from_user.id],
+        "current_turn_index": 0,
+        "turn_order": [callback.from_user.id],
+        "waiting_for_repeat": [],
+        "last_trick_file_id": None,
+        "last_trick_author": None,
+        "time_limit": time_limit,
+        "mode_name": mode_name
+    }
+    next_game_id += 1
+    text = f"✅ Игра #{gid} создана ({mode_name})!\nОжидаем участников."
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=game_lobby_keyboard(gid))
+    await state.clear()
+    await callback.answer()
+
+async def game_join(callback: CallbackQuery):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game or game["status"] != "waiting":
+        await callback.answer("Игра недоступна", show_alert=True)
+        return
+    if uid in game["participants"]:
+        await callback.answer("Ты уже в игре", show_alert=True)
+        return
+    game["participants"].append(uid)
+    game["turn_order"].append(uid)
+    text = f"Игра #{gid}\nУчастников: {len(game['participants'])}"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=game_lobby_keyboard(gid))
+    await callback.answer("✅ Ты в игре!")
+
+async def game_leave(callback: CallbackQuery):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game:
+        return
+    if game["status"] == "active":
+        await callback.answer("Игра идёт, используй LOSE", show_alert=True)
+        return
+    if uid not in game["participants"]:
+        return
+    game["participants"].remove(uid)
+    game["turn_order"].remove(uid)
+    if not game["participants"]:
+        del games[gid]
+        await callback.message.edit_text("Игра удалена")
+    else:
+        if uid == game["creator_id"] and game["participants"]:
+            game["creator_id"] = game["participants"][0]
+        text = f"Игра #{gid}\nУчастников: {len(game['participants'])}"
+        if callback.message.text != text:
+            await callback.message.edit_text(text, reply_markup=game_lobby_keyboard(gid))
+    await callback.answer("Ты вышел")
+
+async def game_start(callback: CallbackQuery):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game or game["status"] != "waiting":
+        await callback.answer("Игра недоступна")
+        return
+    if uid != game["creator_id"]:
+        await callback.answer("Ты не создатель")
+        return
+    if len(game["participants"]) < 1:
+        await callback.answer("Нужен хотя бы 1 игрок")
+        return
+    
+    game["status"] = "active"
+    game["current_turn_index"] = 0
+    current_player = game["turn_order"][0]
+    
+    text = f"🎮 Игра #{gid} началась!\nРежим: {game['mode_name']}\nПервый ход: {get_user_nickname(current_player)}"
+    if callback.message.text != text:
+        await callback.message.edit_text(text)
+    await bot.send_message(current_player, "🔥 YOUR TURN! Загрузи кружок или видео с трюком.", reply_markup=game_active_keyboard(gid))
+    await callback.answer()
+
+async def game_upload_trick(callback: CallbackQuery, state: FSMContext):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game or game["status"] != "active":
+        await callback.answer("Игра не активна")
+        return
+    
+    # Находим кто сейчас должен заказывать трюк
+    if not game["turn_order"]:
+        await callback.answer("Ошибка: нет игроков")
+        return
+    current_player = game["turn_order"][game["current_turn_index"]]
+    if current_player != uid:
+        await callback.answer("Сейчас не твой ход")
+        return
+    
+    await state.update_data(game_id=gid)
+    await callback.message.answer("📹 Отправь кружок или видео с трюком. Все остальные должны будут повторить!")
+    await state.set_state(GameStates.waiting_for_trick_video)
+    await callback.answer()
+
+async def trick_video_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    gid = data["game_id"]
+    game = games.get(gid)
+    if not game or game["status"] != "active":
+        await message.answer("Игра уже не активна")
+        await state.clear()
+        return
+    
+    uid = message.from_user.id
+    current_player = game["turn_order"][game["current_turn_index"]]
+    if current_player != uid:
+        await message.answer("Сейчас не твой ход")
+        await state.clear()
+        return
+    
+    file_id = None
+    if message.video_note:
+        file_id = message.video_note.file_id
+    elif message.video:
+        file_id = message.video.file_id
+    
+    if not file_id:
+        await message.answer("❌ Нужно отправить видео или кружок!")
+        return
+    
+    game["last_trick_file_id"] = file_id
+    game["last_trick_author"] = uid
+    
+    # Ждём повторы от всех остальных игроков
+    game["waiting_for_repeat"] = [p for p in game["participants"] if p != uid]
+    
+    # Отправляем видео всем остальным
+    for pid in game["waiting_for_repeat"]:
+        try:
+            if message.video_note:
+                await bot.send_video_note(pid, file_id)
+            else:
+                await bot.send_video(pid, file_id)
+            await bot.send_message(pid, f"{get_user_nickname(uid)} заказал трюк! YOUR TURN TO REPEAT.\nУ тебя {game['time_limit']//60} минут.", reply_markup=game_repeat_keyboard(gid))
+        except:
+            pass
+    
+    await message.answer(f"✅ Трюк отправлен! Ожидаем пока все повторят.")
+    await state.clear()
+
+async def game_repeat_trick(callback: CallbackQuery, state: FSMContext):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game or game["status"] != "active":
+        await callback.answer("Игра не активна")
+        return
+    
+    if uid not in game["waiting_for_repeat"]:
+        await callback.answer("Ты уже повторил или не должен повторять")
+        return
+    
+    await state.update_data(game_id=gid)
+    await callback.message.answer(f"📹 Загрузи повтор трюка. {game['time_limit']//60} минут.")
+    await state.set_state(GameStates.waiting_for_repeat_video)
+    await callback.answer()
+
+async def repeat_video_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    gid = data["game_id"]
+    game = games.get(gid)
+    if not game or game["status"] != "active":
+        await message.answer("Игра не активна")
+        await state.clear()
+        return
+    
+    uid = message.from_user.id
+    if uid not in game["waiting_for_repeat"]:
+        await message.answer("Ты уже повторил или не должен повторять")
+        await state.clear()
+        return
+    
+    # Принимаем повтор (без проверки)
+    game["waiting_for_repeat"].remove(uid)
+    await message.answer("✅ Твой повтор принят!")
+    
+    # Если все повторили - переходим к следующему ходу
+    if not game["waiting_for_repeat"]:
+        # Переключаем на следующего игрока
+        game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["turn_order"])
+        next_player = game["turn_order"][game["current_turn_index"]]
+        
+        await notify_game_participants(gid, f"🔄 Все повторили! Теперь {get_user_nickname(next_player)} заказывает трюк.", message.bot)
+        await message.bot.send_message(next_player, "🔥 YOUR TURN! Загрузи кружок или видео с трюком.", reply_markup=game_active_keyboard(gid))
+    
+    await state.clear()
+
+async def game_lose(callback: CallbackQuery):
+    gid = int(callback.data.split("_")[2])
+    uid = callback.from_user.id
+    game = games.get(gid)
+    if not game or game["status"] != "active":
+        await callback.answer("Игра не активна")
+        return
+    
+    if uid in game["waiting_for_repeat"]:
+        game["waiting_for_repeat"].remove(uid)
+    
+    if uid in game["participants"]:
+        game["participants"].remove(uid)
+        game["turn_order"].remove(uid)
+        
+        # Корректируем индекс
+        if game["turn_order"] and game["current_turn_index"] >= len(game["turn_order"]):
+            game["current_turn_index"] = 0
+        
+        await callback.answer(f"{get_user_nickname(uid)} LOSE!", show_alert=True)
+        await notify_game_participants(gid, f"💀 {get_user_nickname(uid)} проиграл и выбывает!", callback.bot)
+        
+        # Проверяем победителя
+        if len(game["participants"]) == 1:
+            winner = game["participants"][0]
+            await notify_game_participants(gid, f"🏆 Игра окончена! Победитель: {get_user_nickname(winner)}! 🎉", callback.bot)
+            del games[gid]
+        elif not game["waiting_for_repeat"]:
+            # Если все повторили (или выбыли) - следующий ход
+            game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["turn_order"])
+            next_player = game["turn_order"][game["current_turn_index"]]
+            await callback.bot.send_message(next_player, "🔥 YOUR TURN! Загрузи кружок или видео с трюком.", reply_markup=game_active_keyboard(gid))
+    else:
+        await callback.answer("Ты не в игре")
 # ---------- АДМИН ----------
 async def broadcast(message: Message):
     if message.from_user.id not in ADMIN_IDS:
