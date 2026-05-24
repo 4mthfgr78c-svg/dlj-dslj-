@@ -18,8 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 # ========== ХРАНЕНИЕ ==========
-users = {}          # user_id -> {nickname, stance, contacts, is_admin}
-
+users = {}
 spots = {
     "dumskaya": {"name": "Думская", "active": []},
     "skripka": {"name": "Скрипка", "active": []},
@@ -37,14 +36,14 @@ spots = {
     "park_trekhsotletiya": {"name": "Парк Трехсотлетия", "active": []},
     "veteranov": {"name": "Ветеранов", "active": []},
 }
-
 games = {}
-forum_messages = []
-market_messages = []
+forum_topics = {}
+market_listings = {}
 
 next_game_id = 1
-next_forum_msg_id = 1
-next_market_msg_id = 1
+next_topic_id = 1
+next_topic_msg_id = 1
+next_listing_id = 1
 timer_tasks = {}
 
 # ========== FSM ==========
@@ -58,6 +57,14 @@ class GameStates(StatesGroup):
     waiting_for_repeat_video = State()
     waiting_game_mode = State()
 
+class ForumStates(StatesGroup):
+    waiting_topic_name = State()
+    waiting_topic_message = State()
+
+class MarketStates(StatesGroup):
+    waiting_listing_text = State()
+    waiting_listing_photo = State()
+
 # ========== КЛАВИАТУРЫ ==========
 def main_keyboard():
     buttons = [
@@ -68,20 +75,30 @@ def main_keyboard():
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def spots_list_keyboard():
-    """Клавиатура со списком всех спотов"""
     kb = []
     for spot_id, spot in spots.items():
-        # Если есть активные пользователи — ставим огонёк
         indicator = "🔥 " if spot["active"] else ""
         kb.append([InlineKeyboardButton(text=f"{indicator}{spot['name']}", callback_data=f"spot_{spot_id}")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def spot_detail_keyboard(spot_id: str):
-    """Клавиатура для конкретного спота: отметить/уехать + кто тут"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я здесь", callback_data=f"spot_join_{spot_id}")],
         [InlineKeyboardButton(text="❌ Уехал", callback_data=f"spot_leave_{spot_id}")],
         [InlineKeyboardButton(text="👥 Кто на споте", callback_data=f"spot_who_{spot_id}")]
+    ])
+
+def topics_list_keyboard():
+    kb = []
+    for tid, topic in forum_topics.items():
+        kb.append([InlineKeyboardButton(text=f"📌 {topic['name']} ({len(topic['messages'])} соо)", callback_data=f"topic_{tid}")])
+    kb.append([InlineKeyboardButton(text="➕ Создать тему", callback_data="topic_create")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def topic_actions_keyboard(topic_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Написать в тему", callback_data=f"topic_write_{topic_id}")],
+        [InlineKeyboardButton(text="📋 Список тем", callback_data="topic_list")]
     ])
 
 def game_mode_keyboard():
@@ -108,84 +125,60 @@ def game_repeat_keyboard(game_id):
         [InlineKeyboardButton(text="💀 LOSE", callback_data=f"game_lose_{game_id}")]
     ])
 
+def market_main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Все объявления", callback_data="market_list")],
+        [InlineKeyboardButton(text="➕ Разместить объявление", callback_data="market_create")]
+    ])
+
+def market_list_keyboard(page: int = 0, items_per_page: int = 5):
+    listings = list(market_listings.values())
+    listings.reverse()
+    total = len(listings)
+    start = page * items_per_page
+    end = start + items_per_page
+    current = listings[start:end]
+    
+    kb = []
+    for listing in current:
+        preview = listing['text'][:30] + "..." if len(listing['text']) > 30 else listing['text']
+        kb.append([InlineKeyboardButton(text=f"📦 {listing['nickname']}: {preview}", callback_data=f"market_view_{listing['listing_id']}")])
+    
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"market_page_{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"market_page_{page+1}"))
+    if nav:
+        kb.append(nav)
+    
+    kb.append([InlineKeyboardButton(text="➕ Новое объявление", callback_data="market_create")])
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="market_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def listing_detail_keyboard(listing_id: int, user_id: int):
+    kb = [
+        [InlineKeyboardButton(text="📋 Список объявлений", callback_data="market_list")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="market_main")]
+    ]
+    if market_listings[listing_id]["user_id"] == user_id:
+        kb.append([InlineKeyboardButton(text="🗑️ Удалить объявление", callback_data=f"market_delete_{listing_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ==========
 def get_user_nickname(user_id: int) -> str:
     u = users.get(user_id, {})
     return u.get("nickname", f"User_{user_id}")
 
 def ensure_user(user_id: int):
-    """Создаём пользователя, если его нет (без регистрации)"""
     if user_id not in users:
-        users[user_id] = {
-            "nickname": None,
-            "stance": None,
-            "contacts": None,
-            "is_admin": user_id in ADMIN_IDS
-        }
+        users[user_id] = {"nickname": None, "stance": None, "contacts": None, "is_admin": user_id in ADMIN_IDS}
 
-async def notify_game_participants(game_id: int, text: str, bot: Bot, reply_markup=None):
-    game = games.get(game_id)
-    if not game:
-        return
-    for pid in game["participants"]:
-        try:
-            await bot.send_message(pid, text, reply_markup=reply_markup)
-        except:
-            pass
-
-def advance_turn(game_id: int):
-    game = games[game_id]
-    game["current_player_index"] = (game["current_player_index"] + 1) % len(game["turn_order"])
-    return game["turn_order"][game["current_player_index"]]
-
-def cancel_timer(game_id: int, user_id: int):
-    key = (game_id, user_id)
-    if key in timer_tasks:
-        timer_tasks[key].cancel()
-        del timer_tasks[key]
-
-async def auto_lose(game_id: int, user_id: int, bot: Bot):
-    game = games.get(game_id)
-    if not game or user_id not in game["participants"]:
-        return
-    game["participants"].remove(user_id)
-    game["turn_order"].remove(user_id)
-    await bot.send_message(user_id, "⏰ Время вышло! LOSE.")
-    await notify_game_participants(game_id, f"⏰ {get_user_nickname(user_id)} не успел повторить и выбывает!", bot)
-    if len(game["participants"]) == 1:
-        winner = game["participants"][0]
-        await notify_game_participants(game_id, f"🏆 Победитель: {get_user_nickname(winner)}!", bot)
-        del games[game_id]
-    else:
-        if game["turn_order"][game["current_player_index"]] == user_id:
-            if game["current_player_index"] >= len(game["turn_order"]):
-                game["current_player_index"] = 0
-            elif game["current_player_index"] > 0:
-                game["current_player_index"] -= 1
-
-async def start_repeat_timer(game_id: int, user_id: int, bot: Bot):
-    game = games.get(game_id)
-    if not game:
-        return
-    try:
-        await asyncio.sleep(game["time_limit_seconds"])
-        if game_id in games and user_id in games[game_id]["participants"]:
-            await auto_lose(game_id, user_id, bot)
-    except asyncio.CancelledError:
-        pass
-
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 async def start_command(message: Message):
     ensure_user(message.from_user.id)
     await message.answer(
-        "🛹 Привет, скейтер!\n\n"
-        "Это бот для скейтеров Санкт-Петербурга.\n"
-        "Здесь можно:\n"
-        "• Отмечаться на спотах\n"
-        "• Играть в Game of Skate\n"
-        "• Общаться на форуме\n"
-        "• Покупать/продавать на барахолке\n\n"
-        "Заполни анкету, чтобы другие знали, как тебя зовут: /profile",
+        "Салют!\n\nСпоты, Game of Skate, форум, барахолка — всё здесь.\n\nЗаполни анкету: /profile",
         reply_markup=main_keyboard()
     )
 
@@ -194,34 +187,33 @@ async def profile_command(message: Message, state: FSMContext):
     ensure_user(uid)
     if users[uid].get("nickname"):
         u = users[uid]
-        text = f"👤 Твоя анкета:\nНик: {u.get('nickname', '—')}\nСтойка: {u.get('stance', '—')}\nКонтакты: {u.get('contacts', '—')}"
+        text = f"👤 Анкета:\nНик: {u.get('nickname', '—')}\nСтойка: {u.get('stance', '—')}\nКонтакты: {u.get('contacts', '—')}"
         await message.answer(text, reply_markup=main_keyboard())
     else:
-        await message.answer("Давай заполним анкету! Придумай никнейм (он будет виден всем):")
+        await message.answer("Придумай никнейм (он будет виден всем):")
         await state.set_state(ProfileStates.waiting_nickname)
 
 async def nickname_received(message: Message, state: FSMContext):
-    nickname = message.text.strip()
-    if len(nickname) < 2 or len(nickname) > 20:
-        await message.answer("Никнейм должен быть от 2 до 20 символов. Попробуй ещё:")
+    if len(message.text) < 2 or len(message.text) > 20:
+        await message.answer("Никнейм должен быть от 2 до 20 символов.")
         return
-    users[message.from_user.id]["nickname"] = nickname
-    await message.answer("Отлично! Теперь выбери любимую стойку (обычная / гуфи / не важно):")
+    users[message.from_user.id]["nickname"] = message.text
+    await message.answer("Любимая стойка (обычная / гуфи / не важно):")
     await state.set_state(ProfileStates.waiting_stance)
 
 async def stance_received(message: Message, state: FSMContext):
-    users[message.from_user.id]["stance"] = message.text.strip()
-    await message.answer("Можешь оставить контакты (Telegram, Instagram) или пропустить командой /skip")
+    users[message.from_user.id]["stance"] = message.text
+    await message.answer("Контакты (Telegram/Instagram) или /skip:")
     await state.set_state(ProfileStates.waiting_contacts)
 
 async def contacts_received(message: Message, state: FSMContext):
-    users[message.from_user.id]["contacts"] = message.text.strip()
+    users[message.from_user.id]["contacts"] = message.text
     await message.answer("Анкета готова!", reply_markup=main_keyboard())
     await state.clear()
 
 async def skip_contacts(message: Message, state: FSMContext):
     users[message.from_user.id]["contacts"] = "Не указаны"
-    await message.answer("Анкета готова (контакты пропущены).", reply_markup=main_keyboard())
+    await message.answer("Анкета готова!", reply_markup=main_keyboard())
     await state.clear()
 
 # ---------- СПОТЫ ----------
@@ -234,7 +226,9 @@ async def spot_detail(callback: CallbackQuery):
     active_count = len(spot["active"])
     status_text = "🟢 Активен" if active_count > 0 else "⚪ Нет активных"
     text = f"📍 *{spot['name']}*\n{status_text} (катаются: {active_count})"
-    await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
+    
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
     await callback.answer()
 
 async def join_spot(callback: CallbackQuery):
@@ -243,25 +237,26 @@ async def join_spot(callback: CallbackQuery):
     ensure_user(uid)
     if uid not in spots[spot_id]["active"]:
         spots[spot_id]["active"].append(uid)
-    await callback.answer("✅ Ты отметился на споте!", show_alert=True)
-    # Обновляем сообщение, чтобы обновить статус
+    await callback.answer("✅ Ты на споте!", show_alert=True)
+    
     spot = spots[spot_id]
-    active_count = len(spot["active"])
-    status_text = "🟢 Активен" if active_count > 0 else "⚪ Нет активных"
-    text = f"📍 *{spot['name']}*\n{status_text} (катаются: {active_count})"
-    await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
+    text = f"📍 *{spot['name']}*\n🟢 Активен (катаются: {len(spot['active'])})\n\nТы отметился!"
+    
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
 
 async def leave_spot(callback: CallbackQuery):
     spot_id = callback.data.split("_")[2]
     uid = callback.from_user.id
     if uid in spots[spot_id]["active"]:
         spots[spot_id]["active"].remove(uid)
-    await callback.answer("❌ Ты уехал со спота", show_alert=True)
+    await callback.answer("❌ Ты уехал", show_alert=True)
+    
     spot = spots[spot_id]
-    active_count = len(spot["active"])
-    status_text = "🟢 Активен" if active_count > 0 else "⚪ Нет активных"
-    text = f"📍 *{spot['name']}*\n{status_text} (катаются: {active_count})"
-    await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
+    text = f"📍 *{spot['name']}*\n{'🟢 Активен' if spot['active'] else '⚪ Нет активных'} (катаются: {len(spot['active'])})"
+    
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id), parse_mode="Markdown")
 
 async def who_on_spot(callback: CallbackQuery):
     spot_id = callback.data.split("_")[2]
@@ -275,93 +270,208 @@ async def who_on_spot(callback: CallbackQuery):
     await callback.answer()
 
 # ---------- ФОРУМ ----------
-async def show_forum(message: Message):
-    await message.answer("📢 Форум: пиши сообщения. Чтобы ответить: /reply <id> <текст>")
+async def forum_menu(message: Message):
+    await message.answer("📚 Форум: выбери тему или создай новую:", reply_markup=topics_list_keyboard())
 
-async def post_to_forum(message: Message):
-    if message.text.startswith('/'):
+async def topic_create_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✏️ Придумай название для новой темы (3-50 символов):")
+    await state.set_state(ForumStates.waiting_topic_name)
+    await callback.answer()
+
+async def topic_name_received(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 3 or len(name) > 50:
+        await message.answer("Название должно быть от 3 до 50 символов. Попробуй ещё:")
         return
-    uid = message.from_user.id
-    ensure_user(uid)
-    global next_forum_msg_id
-    forum_messages.append({
-        "msg_id": next_forum_msg_id,
-        "user_id": uid,
-        "nickname": get_user_nickname(uid),
+    global next_topic_id
+    forum_topics[next_topic_id] = {
+        "name": name,
+        "creator_id": message.from_user.id,
+        "created_at": datetime.now(),
+        "messages": []
+    }
+    await message.answer(f"✅ Тема «{name}» создана!", reply_markup=main_keyboard())
+    next_topic_id += 1
+    await state.clear()
+
+async def topic_open(callback: CallbackQuery):
+    topic_id = int(callback.data.split("_")[1])
+    topic = forum_topics.get(topic_id)
+    if not topic:
+        await callback.message.edit_text("❌ Тема не найдена")
+        return
+    text = f"📌 *{topic['name']}*\n\n"
+    for msg in topic["messages"][-10:]:
+        text += f"👤 {msg['nickname']} [{msg['timestamp'].strftime('%H:%M')}]:\n{msg['text']}\n\n"
+    text += f"\n💡 Ответить: `/reply_topic {topic_id} <id сообщения> <текст>`"
+    
+    if callback.message.text != text:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=topic_actions_keyboard(topic_id))
+    await callback.answer()
+
+async def topic_write_start(callback: CallbackQuery, state: FSMContext):
+    topic_id = int(callback.data.split("_")[2])
+    await state.update_data(topic_id=topic_id)
+    await callback.message.answer("✏️ Напиши сообщение в тему:")
+    await state.set_state(ForumStates.waiting_topic_message)
+    await callback.answer()
+
+async def topic_message_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    topic_id = data["topic_id"]
+    topic = forum_topics.get(topic_id)
+    if not topic:
+        await message.answer("❌ Тема не найдена")
+        await state.clear()
+        return
+    global next_topic_msg_id
+    msg = {
+        "msg_id": next_topic_msg_id,
+        "user_id": message.from_user.id,
+        "nickname": get_user_nickname(message.from_user.id),
         "text": message.text,
         "timestamp": datetime.now()
-    })
-    await message.answer(f"Сообщение #{next_forum_msg_id} опубликовано в форуме.\nОтветить: /reply {next_forum_msg_id} <текст>")
-    next_forum_msg_id += 1
+    }
+    topic["messages"].append(msg)
+    await message.answer(f"✅ Сообщение #{next_topic_msg_id} добавлено в тему «{topic['name']}»")
+    next_topic_msg_id += 1
+    await state.clear()
 
-async def reply_to_forum(message: Message):
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Используй: /reply <id сообщения> <твой ответ>")
+async def reply_to_topic_message(message: Message):
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer("📝 Используй: `/reply_topic <id темы> <id сообщения> <твой ответ>`", parse_mode="Markdown")
         return
     try:
-        target_id = int(parts[1])
-        reply_text = parts[2]
+        topic_id = int(parts[1])
+        target_msg_id = int(parts[2])
+        reply_text = parts[3]
     except:
-        await message.answer("Неверный формат")
+        await message.answer("❌ Неверный формат")
         return
-    for msg in forum_messages:
-        if msg["msg_id"] == target_id:
-            author = get_user_nickname(message.from_user.id)
-            await message.answer(f"✅ Ответ отправлен {msg['nickname']} на сообщение #{target_id}")
-            try:
-                await bot.send_message(msg["user_id"], f"📩 Ответ от {author}:\n{reply_text}")
-            except:
-                pass
-            return
-    await message.answer("Сообщение не найдено")
+    topic = forum_topics.get(topic_id)
+    if not topic:
+        await message.answer("❌ Тема не найдена")
+        return
+    target_msg = None
+    for msg in topic["messages"]:
+        if msg["msg_id"] == target_msg_id:
+            target_msg = msg
+            break
+    if not target_msg:
+        await message.answer("❌ Сообщение не найдено")
+        return
+    author = get_user_nickname(message.from_user.id)
+    await message.answer(f"✅ Ответ отправлен {target_msg['nickname']}")
+    try:
+        await bot.send_message(target_msg["user_id"], f"📩 Ответ от {author}:\n{reply_text}")
+    except:
+        pass
+
+async def topic_list(callback: CallbackQuery):
+    text = "📚 Список тем:"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=topics_list_keyboard())
+    await callback.answer()
 
 # ---------- БАРАХОЛКА ----------
-async def show_market(message: Message):
-    await message.answer("🛍️ Барахолка: продажа/обмен. Чтобы ответить: /reply_market <id> <текст>")
+async def market_menu(message: Message):
+    await message.answer("🛍️ Барахолка:", reply_markup=market_main_keyboard())
 
-async def post_to_market(message: Message):
-    if message.text.startswith('/'):
+async def market_list(callback: CallbackQuery, page: int = 0):
+    if not market_listings:
+        text = "📭 Пока нет объявлений. Стань первым!"
+        if callback.message.text != text:
+            await callback.message.edit_text(text, reply_markup=market_main_keyboard())
+        await callback.answer()
         return
-    uid = message.from_user.id
-    ensure_user(uid)
-    global next_market_msg_id
-    market_messages.append({
-        "msg_id": next_market_msg_id,
-        "user_id": uid,
-        "nickname": get_user_nickname(uid),
-        "text": message.text,
-        "timestamp": datetime.now()
-    })
-    await message.answer(f"Объявление #{next_market_msg_id} на барахолке.\nОтветить: /reply_market {next_market_msg_id} <текст>")
-    next_market_msg_id += 1
+    text = "📋 Список объявлений:"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=market_list_keyboard(page))
+    await callback.answer()
 
-async def reply_to_market(message: Message):
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Используй: /reply_market <id объявления> <твой ответ>")
+async def market_list_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await market_list(callback, page)
+
+async def market_create_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✏️ Напиши текст объявления:")
+    await state.set_state(MarketStates.waiting_listing_text)
+    await callback.answer()
+
+async def market_text_received(message: Message, state: FSMContext):
+    if len(message.text) < 5:
+        await message.answer("Текст должен быть длиннее 5 символов.")
         return
-    try:
-        target_id = int(parts[1])
-        reply_text = parts[2]
-    except:
-        await message.answer("Неверный формат")
+    await state.update_data(listing_text=message.text)
+    await message.answer("📸 Отправь фото (или /skip):")
+    await state.set_state(MarketStates.waiting_listing_photo)
+
+async def market_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = data["listing_text"]
+    photo_id = message.photo[-1].file_id if message.photo else None
+    global next_listing_id
+    market_listings[next_listing_id] = {
+        "listing_id": next_listing_id,
+        "user_id": message.from_user.id,
+        "nickname": get_user_nickname(message.from_user.id),
+        "text": text,
+        "photo_id": photo_id,
+        "created_at": datetime.now()
+    }
+    await message.answer(f"✅ Объявление #{next_listing_id} опубликовано!", reply_markup=main_keyboard())
+    next_listing_id += 1
+    await state.clear()
+
+async def market_skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = data["listing_text"]
+    global next_listing_id
+    market_listings[next_listing_id] = {
+        "listing_id": next_listing_id,
+        "user_id": message.from_user.id,
+        "nickname": get_user_nickname(message.from_user.id),
+        "text": text,
+        "photo_id": None,
+        "created_at": datetime.now()
+    }
+    await message.answer(f"✅ Объявление #{next_listing_id} опубликовано!", reply_markup=main_keyboard())
+    next_listing_id += 1
+    await state.clear()
+
+async def market_view(callback: CallbackQuery):
+    listing_id = int(callback.data.split("_")[2])
+    listing = market_listings.get(listing_id)
+    if not listing:
+        await callback.answer("Объявление не найдено", show_alert=True)
         return
-    for msg in market_messages:
-        if msg["msg_id"] == target_id:
-            author = get_user_nickname(message.from_user.id)
-            await message.answer(f"✅ Ответ отправлен {msg['nickname']} на объявление #{target_id}")
-            try:
-                await bot.send_message(msg["user_id"], f"📩 Ответ от {author} на твоё объявление:\n{reply_text}")
-            except:
-                pass
-            return
-    await message.answer("Объявление не найдено")
+    text = f"📦 *Объявление #{listing['listing_id']}*\n👤 {listing['nickname']}\n📅 {listing['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n{listing['text']}"
+    if listing['photo_id']:
+        await callback.message.answer_photo(listing['photo_id'], caption=text, parse_mode="Markdown", reply_markup=listing_detail_keyboard(listing_id, callback.from_user.id))
+    else:
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=listing_detail_keyboard(listing_id, callback.from_user.id))
+    await callback.answer()
 
-# ---------- GAME OF SKATE (код остаётся таким же, как в прошлой версии) ----------
-# ... (здесь весь код игры из предыдущей версии, он не меняется)
+async def market_delete(callback: CallbackQuery):
+    listing_id = int(callback.data.split("_")[2])
+    listing = market_listings.get(listing_id)
+    if not listing or listing["user_id"] != callback.from_user.id:
+        await callback.answer("Нельзя удалить чужое объявление", show_alert=True)
+        return
+    del market_listings[listing_id]
+    await callback.message.edit_text("🗑️ Объявление удалено!", reply_markup=market_main_keyboard())
+    await callback.answer()
 
-# Для краткости, вставь сюда весь код игры из предыдущего сообщения (от async def game_menu до async def game_lose)
+async def market_main(callback: CallbackQuery):
+    text = "🛍️ Барахолка:"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=market_main_keyboard())
+    await callback.answer()
+
+# ---------- GAME OF SKATE (упрощённая версия для начала) ----------
+async def game_menu(message: Message):
+    await message.answer("🎮 Game of Skate в разработке. Скоро появится!")
 
 # ---------- АДМИН ----------
 async def broadcast(message: Message):
@@ -370,16 +480,16 @@ async def broadcast(message: Message):
         return
     text = message.text.replace("/broadcast", "", 1).strip()
     if not text:
-        await message.answer("Напиши /broadcast <текст>")
+        await message.answer("/broadcast <текст>")
         return
     count = 0
-    for uid in users.keys():
+    for uid in users:
         try:
-            await bot.send_message(uid, f"📢 АДМИН: {text}")
+            await bot.send_message(uid, f"📢 {text}")
             count += 1
         except:
             pass
-    await message.answer(f"Рассылка отправлена {count} пользователям")
+    await message.answer(f"Отправлено {count} пользователям")
 
 # ========== ЗАПУСК ==========
 async def main():
@@ -393,14 +503,9 @@ async def main():
     dp.message.register(broadcast, Command("broadcast"))
 
     dp.message.register(show_spots_list, F.text == "🛹 Споты")
-    dp.message.register(show_forum, F.text == "💬 Форум / Чат")
-    dp.message.register(show_market, F.text == "🏪 Барахолка")
-    dp.message.register(game_menu, F.text == "🔄 Game of Skate")  # нужно добавить функцию game_menu
-
-    dp.message.register(post_to_forum, F.text & ~F.text.startswith('/'))
-    dp.message.register(post_to_market, F.text & ~F.text.startswith('/'))
-    dp.message.register(reply_to_forum, Command("reply"))
-    dp.message.register(reply_to_market, Command("reply_market"))
+    dp.message.register(game_menu, F.text == "🔄 Game of Skate")
+    dp.message.register(forum_menu, F.text == "💬 Форум / Чат")
+    dp.message.register(market_menu, F.text == "🏪 Барахолка")
 
     dp.message.register(nickname_received, ProfileStates.waiting_nickname)
     dp.message.register(stance_received, ProfileStates.waiting_stance)
@@ -411,8 +516,23 @@ async def main():
     dp.callback_query.register(leave_spot, F.data.startswith("spot_leave_"))
     dp.callback_query.register(who_on_spot, F.data.startswith("spot_who_"))
 
-    # Регистрация игровых обработчиков (из предыдущей версии)
-    # ...
+    dp.callback_query.register(topic_create_start, F.data == "topic_create")
+    dp.callback_query.register(topic_open, F.data.startswith("topic_") & ~F.data.contains("write") & ~F.data.contains("list"))
+    dp.callback_query.register(topic_write_start, F.data.startswith("topic_write_"))
+    dp.callback_query.register(topic_list, F.data == "topic_list")
+    dp.message.register(topic_name_received, ForumStates.waiting_topic_name)
+    dp.message.register(topic_message_received, ForumStates.waiting_topic_message)
+    dp.message.register(reply_to_topic_message, Command("reply_topic"))
+
+    dp.callback_query.register(market_list, F.data == "market_list")
+    dp.callback_query.register(market_list_page, F.data.startswith("market_page_"))
+    dp.callback_query.register(market_create_start, F.data == "market_create")
+    dp.callback_query.register(market_view, F.data.startswith("market_view_"))
+    dp.callback_query.register(market_delete, F.data.startswith("market_delete_"))
+    dp.callback_query.register(market_main, F.data == "market_main")
+    dp.message.register(market_text_received, MarketStates.waiting_listing_text)
+    dp.message.register(market_photo_received, MarketStates.waiting_listing_photo, F.photo)
+    dp.message.register(market_skip_photo, Command("skip"), MarketStates.waiting_listing_photo)
 
     await dp.start_polling(bot)
 
