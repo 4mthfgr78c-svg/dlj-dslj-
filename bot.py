@@ -174,6 +174,16 @@ def ensure_user(user_id: int):
     if user_id not in users:
         users[user_id] = {"nickname": None, "stance": None, "contacts": None, "is_admin": user_id in ADMIN_IDS}
 
+async def notify_game_participants(game_id: int, text: str, bot: Bot, reply_markup=None):
+    game = games.get(game_id)
+    if not game:
+        return
+    for pid in game["participants"]:
+        try:
+            await bot.send_message(pid, text, reply_markup=reply_markup)
+        except:
+            pass
+
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 async def start_command(message: Message):
     ensure_user(message.from_user.id)
@@ -469,8 +479,7 @@ async def market_main(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=market_main_keyboard())
     await callback.answer()
 
-# ---------- GAME OF SKATE (упрощённая версия для начала) ----------
-# ========== GAME OF SKATE (ПОЛНОЦЕННАЯ ВЕРСИЯ) ==========
+# ---------- GAME OF SKATE ----------
 async def game_menu(message: Message):
     active_games = [(gid, g) for gid, g in games.items() if g["status"] in ["waiting", "active"]]
     if not active_games:
@@ -590,7 +599,6 @@ async def game_upload_trick(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Игра не активна")
         return
     
-    # Находим кто сейчас должен заказывать трюк
     if not game["turn_order"]:
         await callback.answer("Ошибка: нет игроков")
         return
@@ -632,11 +640,8 @@ async def trick_video_received(message: Message, state: FSMContext):
     
     game["last_trick_file_id"] = file_id
     game["last_trick_author"] = uid
-    
-    # Ждём повторы от всех остальных игроков
     game["waiting_for_repeat"] = [p for p in game["participants"] if p != uid]
     
-    # Отправляем видео всем остальным
     for pid in game["waiting_for_repeat"]:
         try:
             if message.video_note:
@@ -658,7 +663,7 @@ async def game_repeat_trick(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Игра не активна")
         return
     
-    if uid not in game["waiting_for_repeat"]:
+    if uid not in game.get("waiting_for_repeat", []):
         await callback.answer("Ты уже повторил или не должен повторять")
         return
     
@@ -677,18 +682,15 @@ async def repeat_video_received(message: Message, state: FSMContext):
         return
     
     uid = message.from_user.id
-    if uid not in game["waiting_for_repeat"]:
+    if uid not in game.get("waiting_for_repeat", []):
         await message.answer("Ты уже повторил или не должен повторять")
         await state.clear()
         return
     
-    # Принимаем повтор (без проверки)
     game["waiting_for_repeat"].remove(uid)
     await message.answer("✅ Твой повтор принят!")
     
-    # Если все повторили - переходим к следующему ходу
     if not game["waiting_for_repeat"]:
-        # Переключаем на следующего игрока
         game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["turn_order"])
         next_player = game["turn_order"][game["current_turn_index"]]
         
@@ -705,94 +707,16 @@ async def game_lose(callback: CallbackQuery):
         await callback.answer("Игра не активна")
         return
     
-    if uid in game["waiting_for_repeat"]:
+    if uid in game.get("waiting_for_repeat", []):
         game["waiting_for_repeat"].remove(uid)
     
     if uid in game["participants"]:
         game["participants"].remove(uid)
-        game["turn_order"].remove(uid)
-        
-        # Корректируем индекс
-        if game["turn_order"] and game["current_turn_index"] >= len(game["turn_order"]):
-            game["current_turn_index"] = 0
+        if uid in game["turn_order"]:
+            idx = game["turn_order"].index(uid)
+            game["turn_order"].remove(uid)
+            if game["turn_order"] and idx <= game["current_turn_index"]:
+                game["current_turn_index"] = (game["current_turn_index"] - 1) % len(game["turn_order"])
         
         await callback.answer(f"{get_user_nickname(uid)} LOSE!", show_alert=True)
-        await notify_game_participants(gid, f"💀 {get_user_nickname(uid)} проиграл и выбывает!", callback.bot)
-        
-        # Проверяем победителя
-        if len(game["participants"]) == 1:
-            winner = game["participants"][0]
-            await notify_game_participants(gid, f"🏆 Игра окончена! Победитель: {get_user_nickname(winner)}! 🎉", callback.bot)
-            del games[gid]
-        elif not game["waiting_for_repeat"]:
-            # Если все повторили (или выбыли) - следующий ход
-            game["current_turn_index"] = (game["current_turn_index"] + 1) % len(game["turn_order"])
-            next_player = game["turn_order"][game["current_turn_index"]]
-            await callback.bot.send_message(next_player, "🔥 YOUR TURN! Загрузи кружок или видео с трюком.", reply_markup=game_active_keyboard(gid))
-    else:
-        await callback.answer("Ты не в игре")
-# ---------- АДМИН ----------
-async def broadcast(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Нет прав")
-        return
-    text = message.text.replace("/broadcast", "", 1).strip()
-    if not text:
-        await message.answer("/broadcast <текст>")
-        return
-    count = 0
-    for uid in users:
-        try:
-            await bot.send_message(uid, f"📢 {text}")
-            count += 1
-        except:
-            pass
-    await message.answer(f"Отправлено {count} пользователям")
-
-# ========== ЗАПУСК ==========
-async def main():
-    global bot
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-
-    dp.message.register(start_command, Command("start"))
-    dp.message.register(profile_command, Command("profile"))
-    dp.message.register(skip_contacts, Command("skip"))
-    dp.message.register(broadcast, Command("broadcast"))
-
-    dp.message.register(show_spots_list, F.text == "🛹 Споты")
-    dp.message.register(game_menu, F.text == "🔄 Game of Skate")
-    dp.message.register(forum_menu, F.text == "💬 Форум / Чат")
-    dp.message.register(market_menu, F.text == "🏪 Барахолка")
-
-    dp.message.register(nickname_received, ProfileStates.waiting_nickname)
-    dp.message.register(stance_received, ProfileStates.waiting_stance)
-    dp.message.register(contacts_received, ProfileStates.waiting_contacts)
-
-    dp.callback_query.register(spot_detail, F.data.startswith("spot_") & ~F.data.contains("join") & ~F.data.contains("leave") & ~F.data.contains("who"))
-    dp.callback_query.register(join_spot, F.data.startswith("spot_join_"))
-    dp.callback_query.register(leave_spot, F.data.startswith("spot_leave_"))
-    dp.callback_query.register(who_on_spot, F.data.startswith("spot_who_"))
-
-    dp.callback_query.register(topic_create_start, F.data == "topic_create")
-    dp.callback_query.register(topic_open, F.data.startswith("topic_") & ~F.data.contains("write") & ~F.data.contains("list"))
-    dp.callback_query.register(topic_write_start, F.data.startswith("topic_write_"))
-    dp.callback_query.register(topic_list, F.data == "topic_list")
-    dp.message.register(topic_name_received, ForumStates.waiting_topic_name)
-    dp.message.register(topic_message_received, ForumStates.waiting_topic_message)
-    dp.message.register(reply_to_topic_message, Command("reply_topic"))
-
-    dp.callback_query.register(market_list, F.data == "market_list")
-    dp.callback_query.register(market_list_page, F.data.startswith("market_page_"))
-    dp.callback_query.register(market_create_start, F.data == "market_create")
-    dp.callback_query.register(market_view, F.data.startswith("market_view_"))
-    dp.callback_query.register(market_delete, F.data.startswith("market_delete_"))
-    dp.callback_query.register(market_main, F.data == "market_main")
-    dp.message.register(market_text_received, MarketStates.waiting_listing_text)
-    dp.message.register(market_photo_received, MarketStates.waiting_listing_photo, F.photo)
-    dp.message.register(market_skip_photo, Command("skip"), MarketStates.waiting_listing_photo)
-
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        await notify_game_participants(gid, f"💀
