@@ -468,6 +468,7 @@ async def main():
     dp.message.register(show_spots_list, F.text == "🛹 Споты")
     dp.message.register(forum_menu, F.text == "💬 Форум / Чат")
     dp.message.register(market_menu, F.text == "🏪 Барахолка")
+    dp.message.register(profile_command, F.text == "👤 Моя анкета")   # <-- ИСПРАВЛЕНО
 
     dp.message.register(nickname_received, ProfileStates.waiting_nickname)
     dp.message.register(stance_received, ProfileStates.waiting_stance)
