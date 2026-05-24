@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Dict, List
 
@@ -11,10 +12,12 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, VideoNote, Video
 )
 from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
 
-# ========== КОНФИГ ==========
-BOT_TOKEN = "8808715816:AAExklLswlVG7eofArKz4woeB4kQtxZIPuc"   # замените!
-ADMIN_IDS = [1896036065]                # замените на свой Telegram ID
+# ========== ЗАГРУЗКА КОНФИГА ==========
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 # ========== ХРАНЕНИЕ ДАННЫХ (в памяти) ==========
 users = {}          # user_id -> {nickname, stance, contacts, is_admin, city}
@@ -182,7 +185,6 @@ async def start_command(message: Message, state: FSMContext):
         await message.answer("Ты уже зарегистрирован. Вот главное меню:", reply_markup=main_keyboard())
 
 async def city_chosen(callback: CallbackQuery, state: FSMContext):
-    spot_id = callback.data.split("_")[1]   # не используется, просто подтверждение
     users[callback.from_user.id]["city"] = "spb"
     await callback.message.edit_text("Город сохранён: Санкт-Петербург. Теперь придумай никнейм (он будет виден всем):")
     await state.set_state(RegStates.waiting_nickname)
@@ -584,7 +586,7 @@ async def broadcast(message: Message):
             pass
     await message.answer(f"Рассылка отправлена {count} пользователям")
 
-# ========== РЕГИСТРАЦИЯ И ЗАПУСК ==========
+# ========== ЗАПУСК ==========
 async def main():
     global bot
     bot = Bot(token=BOT_TOKEN)
