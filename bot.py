@@ -341,3 +341,162 @@ async def topic_list(callback: CallbackQuery):
     if callback.message.text != text:
         await callback.message.edit_text(text, reply_markup=topics_list_keyboard())
     await callback.answer()
+    # ---------- БАРАХОЛКА ----------
+async def market_menu(message: Message):
+    await message.answer("🛍️ Барахолка:", reply_markup=market_main_keyboard())
+
+async def market_list(callback: CallbackQuery, page: int = 0):
+    if not market_listings:
+        text = "📭 Пока нет объявлений. Стань первым!"
+        if callback.message.text != text:
+            await callback.message.edit_text(text, reply_markup=market_main_keyboard())
+        await callback.answer()
+        return
+    text = "📋 Список объявлений:"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=market_list_keyboard(page))
+    await callback.answer()
+
+async def market_list_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await market_list(callback, page)
+
+async def market_create_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✏️ Напиши текст объявления:")
+    await state.set_state(MarketStates.waiting_listing_text)
+    await callback.answer()
+
+async def market_text_received(message: Message, state: FSMContext):
+    if len(message.text) < 5:
+        await message.answer("Текст должен быть длиннее 5 символов.")
+        return
+    await state.update_data(listing_text=message.text)
+    await message.answer("📸 Отправь фото (или /skip):")
+    await state.set_state(MarketStates.waiting_listing_photo)
+
+async def market_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = data["listing_text"]
+    photo_id = message.photo[-1].file_id if message.photo else None
+    global next_listing_id
+    market_listings[next_listing_id] = {
+        "listing_id": next_listing_id,
+        "user_id": message.from_user.id,
+        "nickname": get_user_nickname(message.from_user.id),
+        "text": text,
+        "photo_id": photo_id,
+        "created_at": datetime.now()
+    }
+    await message.answer(f"✅ Объявление #{next_listing_id} опубликовано!", reply_markup=main_keyboard())
+    next_listing_id += 1
+    await state.clear()
+
+async def market_skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = data["listing_text"]
+    global next_listing_id
+    market_listings[next_listing_id] = {
+        "listing_id": next_listing_id,
+        "user_id": message.from_user.id,
+        "nickname": get_user_nickname(message.from_user.id),
+        "text": text,
+        "photo_id": None,
+        "created_at": datetime.now()
+    }
+    await message.answer(f"✅ Объявление #{next_listing_id} опубликовано!", reply_markup=main_keyboard())
+    next_listing_id += 1
+    await state.clear()
+
+async def market_view(callback: CallbackQuery):
+    listing_id = int(callback.data.split("_")[2])
+    listing = market_listings.get(listing_id)
+    if not listing:
+        await callback.answer("Объявление не найдено", show_alert=True)
+        return
+    text = f"📦 *Объявление #{listing['listing_id']}*\n👤 {listing['nickname']}\n📅 {listing['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n{listing['text']}"
+    if listing['photo_id']:
+        await callback.message.answer_photo(listing['photo_id'], caption=text, parse_mode="Markdown", reply_markup=listing_detail_keyboard(listing_id, callback.from_user.id))
+    else:
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=listing_detail_keyboard(listing_id, callback.from_user.id))
+    await callback.answer()
+
+async def market_delete(callback: CallbackQuery):
+    listing_id = int(callback.data.split("_")[2])
+    listing = market_listings.get(listing_id)
+    if not listing or listing["user_id"] != callback.from_user.id:
+        await callback.answer("Нельзя удалить чужое объявление", show_alert=True)
+        return
+    del market_listings[listing_id]
+    await callback.message.edit_text("🗑️ Объявление удалено!", reply_markup=market_main_keyboard())
+    await callback.answer()
+
+async def market_main(callback: CallbackQuery):
+    text = "🛍️ Барахолка:"
+    if callback.message.text != text:
+        await callback.message.edit_text(text, reply_markup=market_main_keyboard())
+    await callback.answer()
+
+# ---------- АДМИН ----------
+async def broadcast(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Нет прав")
+        return
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.answer("/broadcast <текст>")
+        return
+    count = 0
+    for uid in users:
+        try:
+            await bot.send_message(uid, f"📢 {text}")
+            count += 1
+        except:
+            pass
+    await message.answer(f"Отправлено {count} пользователям")
+
+# ========== ЗАПУСК ==========
+async def main():
+    global bot
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.message.register(start_command, Command("start"))
+    dp.message.register(profile_command, Command("profile"))
+    dp.message.register(skip_contacts, Command("skip"))
+    dp.message.register(broadcast, Command("broadcast"))
+
+    dp.message.register(show_spots_list, F.text == "🛹 Споты")
+    dp.message.register(forum_menu, F.text == "💬 Форум / Чат")
+    dp.message.register(market_menu, F.text == "🏪 Барахолка")
+
+    dp.message.register(nickname_received, ProfileStates.waiting_nickname)
+    dp.message.register(stance_received, ProfileStates.waiting_stance)
+    dp.message.register(contacts_received, ProfileStates.waiting_contacts)
+
+    dp.callback_query.register(spot_detail, F.data.startswith("spot_") & ~F.data.contains("join") & ~F.data.contains("leave") & ~F.data.contains("who"))
+    dp.callback_query.register(join_spot, F.data.startswith("spot_join_"))
+    dp.callback_query.register(leave_spot, F.data.startswith("spot_leave_"))
+    dp.callback_query.register(who_on_spot, F.data.startswith("spot_who_"))
+
+    dp.callback_query.register(topic_create_start, F.data == "topic_create")
+    dp.callback_query.register(topic_open, F.data.startswith("topic_") & ~F.data.contains("write") & ~F.data.contains("list"))
+    dp.callback_query.register(topic_write_start, F.data.startswith("topic_write_"))
+    dp.callback_query.register(topic_list, F.data == "topic_list")
+    dp.message.register(topic_name_received, ForumStates.waiting_topic_name)
+    dp.message.register(topic_message_received, ForumStates.waiting_topic_message)
+    dp.message.register(reply_to_topic_message, Command("reply_topic"))
+
+    dp.callback_query.register(market_list, F.data == "market_list")
+    dp.callback_query.register(market_list_page, F.data.startswith("market_page_"))
+    dp.callback_query.register(market_create_start, F.data == "market_create")
+    dp.callback_query.register(market_view, F.data.startswith("market_view_"))
+    dp.callback_query.register(market_delete, F.data.startswith("market_delete_"))
+    dp.callback_query.register(market_main, F.data == "market_main")
+    dp.message.register(market_text_received, MarketStates.waiting_listing_text)
+    dp.message.register(market_photo_received, MarketStates.waiting_listing_photo, F.photo)
+    dp.message.register(market_skip_photo, Command("skip"), MarketStates.waiting_listing_photo)
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
