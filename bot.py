@@ -35,6 +35,7 @@ spots = {
     "begovaya": {"name": "Беговая", "active": []},
     "park_trekhsotletiya": {"name": "Парк Трехсотлетия", "active": []},
     "veteranov": {"name": "Ветеранов", "active": []},
+    "bugry_park": {"name": "Парк в Бугpax", "active": []},
 }
 forum_topics = {}
 market_listings = {}
@@ -45,6 +46,11 @@ next_listing_id = 1
 
 # ========== FSM ==========
 class ProfileStates(StatesGroup):
+    waiting_nickname = State()
+    waiting_stance = State()
+    waiting_contacts = State()
+
+class EditProfileStates(StatesGroup):
     waiting_nickname = State()
     waiting_stance = State()
     waiting_contacts = State()
@@ -156,7 +162,10 @@ async def profile_command(message: Message, state: FSMContext):
     if users[uid].get("nickname"):
         u = users[uid]
         text = f"👤 Анкета:\nНик: {u.get('nickname', '—')}\nСтойка: {u.get('stance', '—')}\nКонтакты: {u.get('contacts', '—')}"
-        await message.answer(text, reply_markup=main_keyboard())
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Редактировать анкету", callback_data="edit_profile")]
+        ])
+        await message.answer(text, reply_markup=kb)
     else:
         await message.answer("Придумай никнейм (он будет виден всем):")
         await state.set_state(ProfileStates.waiting_nickname)
@@ -183,6 +192,59 @@ async def skip_contacts(message: Message, state: FSMContext):
     users[message.from_user.id]["contacts"] = "Не указаны"
     await message.answer("Анкета готова!", reply_markup=main_keyboard())
     await state.clear()
+
+# ---------- РЕДАКТИРОВАНИЕ АНКЕТЫ ----------
+async def edit_profile_command(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    ensure_user(uid)
+    u = users[uid]
+    await message.answer(
+        "✏️ *Редактирование анкеты*\n\n"
+        "Введи новый никнейм (или `-` чтобы оставить текущий):\n"
+        f"Текущий: `{u.get('nickname', 'не задан')}`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(EditProfileStates.waiting_nickname)
+
+async def edit_nickname_received(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    new_nick = message.text.strip()
+    if new_nick != "-":
+        if len(new_nick) < 2 or len(new_nick) > 20:
+            await message.answer("Никнейм должен быть от 2 до 20 символов. Попробуй ещё (или `-` чтобы пропустить):")
+            return
+        users[uid]["nickname"] = new_nick
+    await message.answer(
+        "✏️ Введи новую любимую стойку (или `-` чтобы оставить текущую):\n"
+        f"Текущая: `{users[uid].get('stance', 'не задана')}`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(EditProfileStates.waiting_stance)
+
+async def edit_stance_received(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    new_stance = message.text.strip()
+    if new_stance != "-":
+        users[uid]["stance"] = new_stance
+    await message.answer(
+        "✏️ Введи новые контакты (или `-` чтобы оставить текущие):\n"
+        f"Текущие: `{users[uid].get('contacts', 'не указаны')}`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(EditProfileStates.waiting_contacts)
+
+async def edit_contacts_received(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    new_contacts = message.text.strip()
+    if new_contacts != "-":
+        users[uid]["contacts"] = new_contacts
+    await message.answer("✅ Анкета обновлена!", reply_markup=main_keyboard())
+    await state.clear()
+
+async def edit_profile_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("✏️ Редактирование анкеты")
+    await edit_profile_command(callback.message, state)
+    await callback.answer()
 
 # ---------- СПОТЫ ----------
 async def show_spots_list(message: Message):
@@ -462,17 +524,22 @@ async def main():
 
     dp.message.register(start_command, Command("start"))
     dp.message.register(profile_command, Command("profile"))
+    dp.message.register(edit_profile_command, Command("edit_profile"))
     dp.message.register(skip_contacts, Command("skip"))
     dp.message.register(broadcast, Command("broadcast"))
 
     dp.message.register(show_spots_list, F.text == "🛹 Споты")
     dp.message.register(forum_menu, F.text == "💬 Форум / Чат")
     dp.message.register(market_menu, F.text == "🏪 Барахолка")
-    dp.message.register(profile_command, F.text == "👤 Моя анкета")   # <-- ИСПРАВЛЕНО
+    dp.message.register(profile_command, F.text == "👤 Моя анкета")
 
     dp.message.register(nickname_received, ProfileStates.waiting_nickname)
     dp.message.register(stance_received, ProfileStates.waiting_stance)
     dp.message.register(contacts_received, ProfileStates.waiting_contacts)
+
+    dp.message.register(edit_nickname_received, EditProfileStates.waiting_nickname)
+    dp.message.register(edit_stance_received, EditProfileStates.waiting_stance)
+    dp.message.register(edit_contacts_received, EditProfileStates.waiting_contacts)
 
     dp.callback_query.register(spot_detail, F.data.startswith("spot_") & ~F.data.contains("join") & ~F.data.contains("leave") & ~F.data.contains("who"))
     dp.callback_query.register(join_spot, F.data.startswith("spot_join_"))
@@ -496,6 +563,8 @@ async def main():
     dp.message.register(market_text_received, MarketStates.waiting_listing_text)
     dp.message.register(market_photo_received, MarketStates.waiting_listing_photo, F.photo)
     dp.message.register(market_skip_photo, Command("skip"), MarketStates.waiting_listing_photo)
+
+    dp.callback_query.register(edit_profile_callback, F.data == "edit_profile")
 
     await dp.start_polling(bot)
 
