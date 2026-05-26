@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, Location
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
@@ -19,30 +19,12 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 
 # ========== ХРАНЕНИЕ ==========
 users = {}
-# Стандартные споты + пользовательские будут в одном словаре
-# Структура: spot_id: {"name": str, "description": str, "photo_id": str (опционально), "lat": float, "lon": float, "added_by": int, "is_custom": bool}
-spots = {
-    "dumskaya": {"name": "Думская", "description": "", "photo_id": None, "lat": 59.9343, "lon": 30.3351, "added_by": 0, "is_custom": False, "active": []},
-    "skripka": {"name": "Скрипка", "description": "", "photo_id": None, "lat": 59.9345, "lon": 30.3355, "added_by": 0, "is_custom": False, "active": []},
-    "pionerka_pod_mostom": {"name": "Пионерка под мостом", "description": "", "photo_id": None, "lat": 59.9500, "lon": 30.3167, "added_by": 0, "is_custom": False, "active": []},
-    "pionerka_park": {"name": "Пионерка парк", "description": "", "photo_id": None, "lat": 59.9500, "lon": 30.3167, "added_by": 0, "is_custom": False, "active": []},
-    "ska": {"name": "СКА", "description": "", "photo_id": None, "lat": 59.9345, "lon": 30.3351, "added_by": 0, "is_custom": False, "active": []},
-    "moskovskaya": {"name": "Московская", "description": "", "photo_id": None, "lat": 59.8925, "lon": 30.3189, "added_by": 0, "is_custom": False, "active": []},
-    "porebriki_obvodny": {"name": "Поребрики на Обводном", "description": "", "photo_id": None, "lat": 59.9126, "lon": 30.3202, "added_by": 0, "is_custom": False, "active": []},
-    "piskar_pod_mostom": {"name": "Пискарь под мостом", "description": "", "photo_id": None, "lat": 59.9500, "lon": 30.3167, "added_by": 0, "is_custom": False, "active": []},
-    "udelka": {"name": "Уделка", "description": "", "photo_id": None, "lat": 60.0167, "lon": 30.3167, "added_by": 0, "is_custom": False, "active": []},
-    "ploshad_lenina": {"name": "Площадь Ленина", "description": "", "photo_id": None, "lat": 59.9325, "lon": 30.3069, "added_by": 0, "is_custom": False, "active": []},
-    "ssa": {"name": "ССА", "description": "", "photo_id": None, "lat": 59.9343, "lon": 30.3351, "added_by": 0, "is_custom": False, "active": []},
-    "virazh": {"name": "ВираЖ", "description": "", "photo_id": None, "lat": 59.9343, "lon": 30.3351, "added_by": 0, "is_custom": False, "active": []},
-    "begovaya": {"name": "Беговая", "description": "", "photo_id": None, "lat": 59.9895, "lon": 30.1942, "added_by": 0, "is_custom": False, "active": []},
-    "park_trekhsotletiya": {"name": "Парк Трехсотлетия", "description": "", "photo_id": None, "lat": 59.9711, "lon": 30.2083, "added_by": 0, "is_custom": False, "active": []},
-    "veteranov": {"name": "Ветеранов", "description": "", "photo_id": None, "lat": 59.8425, "lon": 30.2600, "added_by": 0, "is_custom": False, "active": []},
-    "bugry_park": {"name": "Парк в Бугpax", "description": "", "photo_id": None, "lat": 60.0800, "lon": 30.4300, "added_by": 0, "is_custom": False, "active": []},
-}
-next_spot_id = 1000  # для пользовательских спотов
+# Словарь спотов теперь пустой. Споты будут добавлять пользователи.
+spots = {}
 forum_topics = {}
 market_listings = {}
 
+next_spot_id = 1
 next_topic_id = 1
 next_topic_msg_id = 1
 next_listing_id = 1
@@ -83,28 +65,22 @@ def main_keyboard():
 
 def spots_list_keyboard():
     kb = []
-    # Показываем только активные споты (без учёта is_custom, все)
     for spot_id, spot in spots.items():
         indicator = "🔥 " if spot.get("active") and len(spot["active"]) > 0 else ""
-        # Помечаем пользовательские споты звёздочкой
-        marker = "⭐ " if spot.get("is_custom") else ""
-        kb.append([InlineKeyboardButton(text=f"{indicator}{marker}{spot['name']}", callback_data=f"spot_{spot_id}")])
-    # Кнопка добавления спота
+        kb.append([InlineKeyboardButton(text=f"{indicator}{spot['name']}", callback_data=f"spot_{spot_id}")])
     kb.append([InlineKeyboardButton(text="➕ Добавить свой спот", callback_data="add_spot_start")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def spot_detail_keyboard(spot_id: str, user_id: int = None):
+def spot_detail_keyboard(spot_id: int, user_id: int = None):
     kb = [
         [InlineKeyboardButton(text="✅ Я здесь", callback_data=f"spot_join_{spot_id}")],
         [InlineKeyboardButton(text="❌ Уехал", callback_data=f"spot_leave_{spot_id}")],
         [InlineKeyboardButton(text="👥 Кто на споте", callback_data=f"spot_who_{spot_id}")]
     ]
-    # Если у спота есть координаты, добавим кнопку карты
     spot = spots.get(spot_id)
     if spot and spot.get("lat") and spot.get("lon"):
         maps_url = f"https://www.google.com/maps?q={spot['lat']},{spot['lon']}"
         kb.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
-    # Если спот добавлен пользователем и это его спот, можно добавить кнопку удаления (опционально)
     if user_id and spot and spot.get("added_by") == user_id:
         kb.append([InlineKeyboardButton(text="🗑️ Удалить мой спот", callback_data=f"spot_delete_{spot_id}")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -269,12 +245,15 @@ async def edit_profile_callback(callback: CallbackQuery, state: FSMContext):
     await edit_profile_command(callback.message, state)
     await callback.answer()
 
-# ---------- СПОТЫ (основные функции + добавление) ----------
+# ---------- СПОТЫ (только пользовательские) ----------
 async def show_spots_list(message: Message):
-    await message.answer("Выбери спот или добавь свой:", reply_markup=spots_list_keyboard())
+    if not spots:
+        await message.answer("Пока нет ни одного спота. Будь первым — добавь свой спот!", reply_markup=spots_list_keyboard())
+    else:
+        await message.answer("Выбери спот или добавь свой:", reply_markup=spots_list_keyboard())
 
 async def spot_detail(callback: CallbackQuery):
-    spot_id = callback.data.split("_")[1]
+    spot_id = int(callback.data.split("_")[1])
     spot = spots.get(spot_id)
     if not spot:
         await callback.message.edit_text("❌ Спот не найден")
@@ -285,14 +264,12 @@ async def spot_detail(callback: CallbackQuery):
     text = f"📍 *{spot['name']}*\n{status_text} (катаются: {active_count})\n\n"
     if spot.get("description"):
         text += f"📝 {spot['description']}\n\n"
-    if spot.get("is_custom"):
-        text += f"👤 Добавлен: {get_user_nickname(spot['added_by'])}\n"
-    
+    text += f"👤 Добавлен: {get_user_nickname(spot['added_by'])}"
     await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id, callback.from_user.id), parse_mode="Markdown")
     await callback.answer()
 
 async def join_spot(callback: CallbackQuery):
-    spot_id = callback.data.split("_")[2]
+    spot_id = int(callback.data.split("_")[2])
     uid = callback.from_user.id
     ensure_user(uid)
     spot = spots.get(spot_id)
@@ -306,13 +283,14 @@ async def join_spot(callback: CallbackQuery):
     await callback.answer("✅ Ты на споте!", show_alert=True)
     
     active_count = len(spot["active"])
-    text = f"📍 *{spot['name']}*\n🟢 Активен (катаются: {active_count})\n\nТы отметился!"
+    text = f"📍 *{spot['name']}*\n🟢 Активен (катаются: {active_count})\n\nТы отметился!\n\n"
     if spot.get("description"):
-        text += f"\n📝 {spot['description']}"
+        text += f"📝 {spot['description']}\n"
+    text += f"👤 Добавлен: {get_user_nickname(spot['added_by'])}"
     await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id, callback.from_user.id), parse_mode="Markdown")
 
 async def leave_spot(callback: CallbackQuery):
-    spot_id = callback.data.split("_")[2]
+    spot_id = int(callback.data.split("_")[2])
     uid = callback.from_user.id
     spot = spots.get(spot_id)
     if spot and uid in spot.get("active", []):
@@ -320,13 +298,14 @@ async def leave_spot(callback: CallbackQuery):
     await callback.answer("❌ Ты уехал", show_alert=True)
     
     active_count = len(spot.get("active", []))
-    text = f"📍 *{spot['name']}*\n{'🟢 Активен' if active_count > 0 else '⚪ Нет активных'} (катаются: {active_count})"
+    text = f"📍 *{spot['name']}*\n{'🟢 Активен' if active_count > 0 else '⚪ Нет активных'} (катаются: {active_count})\n\n"
     if spot.get("description"):
-        text += f"\n📝 {spot['description']}"
+        text += f"📝 {spot['description']}\n"
+    text += f"👤 Добавлен: {get_user_nickname(spot['added_by'])}"
     await callback.message.edit_text(text, reply_markup=spot_detail_keyboard(spot_id, callback.from_user.id), parse_mode="Markdown")
 
 async def who_on_spot(callback: CallbackQuery):
-    spot_id = callback.data.split("_")[2]
+    spot_id = int(callback.data.split("_")[2])
     spot = spots.get(spot_id)
     if not spot:
         await callback.answer("Спот не найден", show_alert=True)
@@ -389,7 +368,7 @@ async def add_spot_location(message: Message, state: FSMContext):
     photo_id = data.get("photo_id")
     
     global next_spot_id
-    spot_id = str(next_spot_id)
+    spot_id = next_spot_id
     next_spot_id += 1
     
     spots[spot_id] = {
@@ -399,7 +378,6 @@ async def add_spot_location(message: Message, state: FSMContext):
         "lat": lat,
         "lon": lon,
         "added_by": message.from_user.id,
-        "is_custom": True,
         "active": []
     }
     
@@ -413,7 +391,7 @@ async def add_spot_skip_location(message: Message, state: FSMContext):
     photo_id = data.get("photo_id")
     
     global next_spot_id
-    spot_id = str(next_spot_id)
+    spot_id = next_spot_id
     next_spot_id += 1
     
     spots[spot_id] = {
@@ -423,7 +401,6 @@ async def add_spot_skip_location(message: Message, state: FSMContext):
         "lat": None,
         "lon": None,
         "added_by": message.from_user.id,
-        "is_custom": True,
         "active": []
     }
     
@@ -431,9 +408,9 @@ async def add_spot_skip_location(message: Message, state: FSMContext):
     await state.clear()
 
 async def delete_custom_spot(callback: CallbackQuery):
-    spot_id = callback.data.split("_")[2]
+    spot_id = int(callback.data.split("_")[2])
     spot = spots.get(spot_id)
-    if not spot or not spot.get("is_custom") or spot.get("added_by") != callback.from_user.id:
+    if not spot or spot.get("added_by") != callback.from_user.id:
         await callback.answer("❌ Нельзя удалить чужой спот", show_alert=True)
         return
     del spots[spot_id]
@@ -682,7 +659,7 @@ async def main():
     dp.message.register(edit_stance_received, EditProfileStates.waiting_stance)
     dp.message.register(edit_contacts_received, EditProfileStates.waiting_contacts)
 
-    # Обработчики добавления спота
+    # Добавление спотов
     dp.callback_query.register(add_spot_start, F.data == "add_spot_start")
     dp.message.register(add_spot_name, AddSpotStates.waiting_name)
     dp.message.register(add_spot_description, AddSpotStates.waiting_description)
@@ -692,11 +669,13 @@ async def main():
     dp.message.register(add_spot_skip_location, Command("skip"), AddSpotStates.waiting_location)
     dp.callback_query.register(delete_custom_spot, F.data.startswith("spot_delete_"))
 
+    # Споты
     dp.callback_query.register(spot_detail, F.data.startswith("spot_") & ~F.data.contains("join") & ~F.data.contains("leave") & ~F.data.contains("who") & ~F.data.contains("delete"))
     dp.callback_query.register(join_spot, F.data.startswith("spot_join_"))
     dp.callback_query.register(leave_spot, F.data.startswith("spot_leave_"))
     dp.callback_query.register(who_on_spot, F.data.startswith("spot_who_"))
 
+    # Форум
     dp.callback_query.register(topic_create_start, F.data == "topic_create")
     dp.callback_query.register(topic_open, F.data.startswith("topic_") & ~F.data.contains("write") & ~F.data.contains("list"))
     dp.callback_query.register(topic_write_start, F.data.startswith("topic_write_"))
@@ -705,6 +684,7 @@ async def main():
     dp.message.register(topic_message_received, ForumStates.waiting_topic_message)
     dp.message.register(reply_to_topic_message, Command("reply_topic"))
 
+    # Барахолка
     dp.callback_query.register(market_list, F.data == "market_list")
     dp.callback_query.register(market_list_page, F.data.startswith("market_page_"))
     dp.callback_query.register(market_create_start, F.data == "market_create")
@@ -715,6 +695,7 @@ async def main():
     dp.message.register(market_photo_received, MarketStates.waiting_listing_photo, F.photo)
     dp.message.register(market_skip_photo, Command("skip"), MarketStates.waiting_listing_photo)
 
+    # Редактирование анкеты
     dp.callback_query.register(edit_profile_callback, F.data == "edit_profile")
 
     await dp.start_polling(bot)
