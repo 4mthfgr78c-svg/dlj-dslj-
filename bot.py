@@ -19,7 +19,6 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 
 # ========== ХРАНЕНИЕ ==========
 users = {}
-# Словарь спотов теперь пустой. Споты будут добавлять пользователи.
 spots = {}
 forum_topics = {}
 market_listings = {}
@@ -638,6 +637,10 @@ async def broadcast(message: Message):
 async def main():
     global bot
     bot = Bot(token=BOT_TOKEN)
+    
+    # Удаляем вебхук перед стартом polling (исправляет ошибку Conflict)
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.register(start_command, Command("start"))
